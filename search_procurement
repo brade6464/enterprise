@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Search Gwangmyeong City procurement registration records.
+
+This script searches a local CSV dataset for company-related information.
+
+Usage:
+  python search_procurement.py --query "company name"
+  python search_procurement.py --query "company" --column companyname
+  python search_procurement.py --dataset data/gwangmyeong_procurement.csv --query "홍길동"
+
+The dataset is expected to be a UTF-8 CSV with a header row.
+Example columns:
+  companyname, registrationno, address, businesstype, registrationdate
+
+If you need to acquire real data, export the "광명시 조달업체 등록 내역" from the official site
+and save it as a CSV under the `data/` folder.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+import urllib.request
+from pathlib import Path
+from typing import Iterator, Mapping, Optional, Sequence, Tuple
+
+DEFAULT_DATASET = Path("data/gwangmyeong_procurement.csv")
+DEFAULT_API_CACHE = Path("data/api_cache.csv")
+
+
+def load_csv(path: Path) -> Tuple[Sequence[str], Iterator[Mapping[str, str]]]:
+    """Load a UTF-8 CSV file and yield rows as dicts."""
+    try:
+        f = path.open("r", encoding="utf-8-sig", newline="")
+    except FileNotFoundError:
+        raise
+
+    reader = csv.DictReader(f)
+    return reader.fieldnames or [], reader
+
+
+def match_row(row: Mapping[str, str], query: str, column: Optional[str]) -> bool:
+    """Return True when the row matches the query.
+
+    If `column` is provided, only search within that column.
+    Otherwise, search all columns.
+    """
+
+    query = query.strip().lower()
+    if not query:
+        return False
+
+    if column:
+        value = row.get(column, "")
+        return query in value.lower()
+
+    for value in row.values():
+        if query in (value or "").lower():
+            return True
+
+    return False
+
+
+def format_row(row: Mapping[str, str], fields: Sequence[str]) -> str:
+    """Format a row for terminal output."""
+    # Only include fields that exist in the CSV
+    ordered = [f for f in fields if f in row]
+    pairs = [f"{f}: {row.get(f, '')}" for f in ordered]
+    return " | ".join(pairs)
+
+
+def fetch_api_data(url: str, dest_path: Path, api_key: Optional[str] = None) -> Path:
+    """Fetch data from a public API and save it as a CSV file.
+
+    The function attempts to interpret the response as JSON first (array of objects or
+    {{ data: [...] }}). If JSON parsing fails, it treats the response as CSV text.
+    """
+
+    req = urllib.request.Request(url)
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read()
+
+    text = raw.decode("utf-8-sig")
+
+    # Try JSON first (common for REST APIs)
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            rows = payload["data"]
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            raise ValueError("JSON payload is not a list or does not contain 'data' list")
+
+        if not rows:
+            raise ValueError("API returned no rows")
+
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        with dest_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: v for k, v in r.items()})
+
+        return dest_path
+    except Exception:
+        # Fallback to raw CSV
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        with dest_path.open("w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+        return dest_path
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Search a Gwangmyeong City procurement registration CSV for company information."
+    )
+
+    parser.add_argument(
+        "--dataset",
+        "-d",
+        type=Path,
+        default=DEFAULT_DATASET,
+        help=f"Path to CSV file (default: {DEFAULT_DATASET})",
+    )
+    parser.add_argument(
+        "--api-url",
+        help="Public API URL that returns company registration data (JSON or CSV).",
+    )
+    parser.add_argument(
+        "--api-key",
+        help="Optional API key used for Authorization header (Bearer token).",
+    )
+    parser.add_argument(
+        "--api-cache",
+        type=Path,
+        default=DEFAULT_API_CACHE,
+        help=f"When using --api-url, cache response to this CSV file (default: {DEFAULT_API_CACHE}).",
+    )
+    parser.add_argument(
+        "--query",
+        "-q",
+        required=True,
+        help="Search query (company name, registration number, etc.)",
+    )
+    parser.add_argument(
+        "--column",
+        "-c",
+        help="Optional column name to restrict the search to (e.g., companyname).",
+    )
+    parser.add_argument(
+        "--limit",
+        "-l",
+        type=int,
+        default=50,
+        help="Maximum number of rows to print (default 50).",
+    )
+
+    args = parser.parse_args(argv)
+
+    dataset_path = args.dataset
+    if args.api_url:
+        try:
+            dataset_path = fetch_api_data(args.api_url, args.api_cache, args.api_key)
+            print(f"Fetched API data to {dataset_path}", file=sys.stderr)
+        except Exception as exc:
+            print(f"ERROR: Failed to fetch API data: {exc}", file=sys.stderr)
+            return 4
+
+    try:
+        fieldnames, rows = load_csv(dataset_path)
+    except FileNotFoundError:
+        print(f"ERROR: Dataset not found: {dataset_path}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"ERROR: Failed to read dataset: {exc}", file=sys.stderr)
+        return 1
+
+    if args.column and args.column not in fieldnames:
+        print(
+            f"ERROR: Column '{args.column}' not found in dataset. Available columns: {', '.join(fieldnames)}",
+            file=sys.stderr,
+        )
+        return 3
+
+    found = 0
+    for row in rows:
+        if match_row(row, args.query, args.column):
+            print(format_row(row, fieldnames))
+            found += 1
+            if found >= args.limit:
+                break
+
+    if found == 0:
+        print("No matching records found.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
